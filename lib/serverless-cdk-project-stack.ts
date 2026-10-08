@@ -1,6 +1,5 @@
 import * as cdk from 'aws-cdk-lib/core';
 import { Construct } from 'constructs';
-// import * as sqs from 'aws-cdk-lib/aws-sqs';
 
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import { AwsCustomResource, AwsCustomResourcePolicy, PhysicalResourceId } from 'aws-cdk-lib/custom-resources';
@@ -13,7 +12,10 @@ import * as apigateway from "aws-cdk-lib/aws-apigateway";
 import * as path from 'path';
 
 export interface ServerlessCdkProjectStackProps extends cdk.StackProps {
+  /** Name of the DynamoDB table. */
   tableName: string;
+  /** API Gateway stage name (default: "prod"). */
+  stageName?: string;
 }
 
 export class ServerlessCdkProjectStack extends cdk.Stack {
@@ -21,7 +23,8 @@ export class ServerlessCdkProjectStack extends cdk.Stack {
     super(scope, id, props);
 
     const tableName = props.tableName;
- 
+    const stageName = props.stageName ?? 'prod';
+
     // Step 1: Create a DynamoDB table CfnTable construct
     const cfnTable = new dynamodb.CfnTable(this, 'StudentItemsTable', {
       tableName: tableName,
@@ -42,8 +45,10 @@ export class ServerlessCdkProjectStack extends cdk.Stack {
 
 
     // Step 2: Populate the StudentItems table
+    // The seed resources reference the table itself (not just its name), so
+    // CloudFormation waits for the table to exist before inserting items.
     // Insert sample item 1001
-    createDynamoInsertResource(this, "InsertItem1001", tableName, {
+    createDynamoInsertResource(this, "InsertItem1001", cfnTable, {
       id: "1001",
       name: "AWS CDK",
       description: "Infrastructure as Code",
@@ -51,7 +56,7 @@ export class ServerlessCdkProjectStack extends cdk.Stack {
     });
 
     // Insert sample item 1002
-    createDynamoInsertResource(this, "InsertItem1002", tableName, {
+    createDynamoInsertResource(this, "InsertItem1002", cfnTable, {
       id: "1002",
       name: "AWS Lambda",
       description: "Serverless Compute",
@@ -75,7 +80,9 @@ export class ServerlessCdkProjectStack extends cdk.Stack {
     });
 
     // 3.2. IAM Policy for Lambda to access DynamoDB and Logs
-    new iam.CfnPolicy(this, 'LambdaDynamoPolicy', {
+    // Least privilege: DynamoDB actions on this table only, logs on this function's log group only.
+    const functionName = 'StudentItemsHandler';
+    const lambdaPolicy = new iam.CfnPolicy(this, 'LambdaDynamoPolicy', {
       policyName: 'LambdaDynamoAccess',
       roles: [lambdaRole.ref],
       policyDocument: {
@@ -90,7 +97,7 @@ export class ServerlessCdkProjectStack extends cdk.Stack {
               'dynamodb:DeleteItem',
               'dynamodb:Scan'
             ],
-            Resource: '*'
+            Resource: cfnTable.attrArn
           },
           {
             Effect: 'Allow',
@@ -99,7 +106,7 @@ export class ServerlessCdkProjectStack extends cdk.Stack {
               'logs:CreateLogStream',
               'logs:PutLogEvents'
             ],
-            Resource: '*'
+            Resource: `arn:${cdk.Aws.PARTITION}:logs:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:log-group:/aws/lambda/${functionName}:*`
           }
         ]
       }
@@ -113,9 +120,10 @@ export class ServerlessCdkProjectStack extends cdk.Stack {
 
     // 4.2. Create Lambda function 
     const lambdaFn = new lambda.CfnFunction(this, 'StudentLambda', {
-      functionName: 'StudentItemsHandler',
+      functionName: functionName,
       handler: 'index.handler',
-      runtime: 'nodejs20.x',
+      // nodejs20.x is deprecated; nodejs24.x is the current LTS runtime
+      runtime: 'nodejs24.x',
       role: lambdaRole.attrArn,
       architectures: ['x86_64'],
       memorySize: 256,
@@ -130,19 +138,25 @@ export class ServerlessCdkProjectStack extends cdk.Stack {
         s3Key: lambdaAsset.s3ObjectKey,
       },
     });
+    // Make sure the role has its permissions before the function is created
+    lambdaFn.addResourceDependency(lambdaPolicy);
 
-    // 4.3. Grant API Gateway permission to invoke your Lambda
+
+    // Step 5: Implementation of API Gateway, resources, and methods
+    // 5.1. Create a REST API
+    const api = new apigateway.CfnRestApi(this, "StudentApi", {
+      name: "StudentItemsApi",
+      description: "CRUD API for the StudentItems DynamoDB table",
+      endpointConfiguration: { types: ["REGIONAL"] },
+    });
+
+    // 5.1.1. Grant API Gateway permission to invoke the Lambda
+    // (scoped to this API only, instead of any API Gateway in the account)
     new lambda.CfnPermission(this, "ApiGatewayInvokePermission", {
       action: "lambda:InvokeFunction",
       principal: "apigateway.amazonaws.com",
       functionName: lambdaFn.ref,
-    });
-
-
-    // Step 5: Implementation of API Gateway, resources, and methods
-    // 5.1. Create an HTTP API
-    const api = new apigateway.CfnRestApi(this, "StudentApi", {
-      name: "StudentItemsApi",
+      sourceArn: `arn:${cdk.Aws.PARTITION}:execute-api:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:${api.ref}/*/*/*`,
     });
 
     // 5.2. Get Root resource ID
@@ -169,7 +183,7 @@ export class ServerlessCdkProjectStack extends cdk.Stack {
   
     // 5.4. Create routes
     // 5.4.1. GET /items
-    createApiGatewayMethod(
+    const getItemsMethod = createApiGatewayMethod(
       this,
       "GetItemsMethod",
       api.ref,
@@ -180,7 +194,7 @@ export class ServerlessCdkProjectStack extends cdk.Stack {
     );
 
     // 5.4.2. POST /items
-    createApiGatewayMethod(
+    const postItemsMethod = createApiGatewayMethod(
       this,
       "PostItemsMethod",
       api.ref,
@@ -191,7 +205,7 @@ export class ServerlessCdkProjectStack extends cdk.Stack {
     );
 
     // 5.4.3. GET /items/{id}
-    createApiGatewayMethod(
+    const getItemByIdMethod = createApiGatewayMethod(
       this,
       "GetItemByIdMethod",
       api.ref,
@@ -202,7 +216,7 @@ export class ServerlessCdkProjectStack extends cdk.Stack {
     );
 
     // 5.4.4. PUT /items/{id}
-    createApiGatewayMethod(
+    const putItemByIdMethod = createApiGatewayMethod(
       this,
       "PutItemByIdMethod",
       api.ref,
@@ -213,7 +227,7 @@ export class ServerlessCdkProjectStack extends cdk.Stack {
     );
 
     // 5.4.5. DELETE /items/{id}
-    createApiGatewayMethod(
+    const deleteItemByIdMethod = createApiGatewayMethod(
       this,
       "DeleteItemByIdMethod",
       api.ref,
@@ -223,6 +237,30 @@ export class ServerlessCdkProjectStack extends cdk.Stack {
       this.region
     );
 
+    // Step 6: Deploy the API to a stage
+    // Without a deployment and a stage, the API exists but has no URL that
+    // can be called. The deployment must wait until every method exists.
+    const deployment = new apigateway.CfnDeployment(this, "StudentApiDeployment", {
+      restApiId: api.ref,
+      description: "Initial deployment",
+    });
+    for (const method of [getItemsMethod, postItemsMethod, getItemByIdMethod, putItemByIdMethod, deleteItemByIdMethod]) {
+      deployment.addResourceDependency(method);
+    }
+
+    const stage = new apigateway.CfnStage(this, "StudentApiStage", {
+      restApiId: api.ref,
+      deploymentId: deployment.ref,
+      stageName: stageName,
+    });
+
+    // Step 7: Outputs
+    new cdk.CfnOutput(this, "ApiUrl", {
+      description: "Base URL of the Student Items API",
+      value: `https://${api.ref}.execute-api.${cdk.Aws.REGION}.${cdk.Aws.URL_SUFFIX}/${stage.ref}/`,
+    });
+    new cdk.CfnOutput(this, "TableName", { value: cfnTable.ref });
+    new cdk.CfnOutput(this, "LambdaFunctionName", { value: lambdaFn.ref });
   }
 }
 
@@ -232,7 +270,7 @@ export class ServerlessCdkProjectStack extends cdk.Stack {
 export function createDynamoInsertResource(
   scope: Construct,
   id: string,
-  tableName: string,
+  table: dynamodb.CfnTable,
   item: Record<string, string>
 ) {
   // Convert JS object into DynamoDB AttributeValue map
@@ -246,13 +284,13 @@ export function createDynamoInsertResource(
       service: "DynamoDB",
       action: "putItem",
       parameters: {
-        TableName: tableName,
+        TableName: table.ref,
         Item: dynamoItem,
       },
       physicalResourceId: PhysicalResourceId.of(id),
     },
     policy: AwsCustomResourcePolicy.fromSdkCalls({
-      resources: AwsCustomResourcePolicy.ANY_RESOURCE,
+      resources: [table.attrArn],
     }),
   });
 }
